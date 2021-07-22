@@ -2,7 +2,6 @@ package runstats
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
 	"time"
@@ -16,7 +15,6 @@ import (
 const (
 	defaultHost               = "localhost:8086"
 	defaultMeasurement        = "go.runtime"
-	defaultDatabase           = "stats"
 	defaultBucket             = "go"
 	defaultOrg                = "metrics"
 	defaultCollectionInterval = 10 * time.Second
@@ -29,10 +27,6 @@ type Config struct {
 	// InfluxDb host:port pair.
 	// Default is "localhost:8086".
 	Host string `json:"host" yaml:"host" mapstructure:"host"`
-
-	// Database to write points to.
-	// Default is "stats" and is auto created
-	Database string `json:"database" yaml:"database" mapstructure:"database"`
 
 	// Token.
 	Token string `json:"token" yaml:"token" mapstructure:"token"`
@@ -67,9 +61,6 @@ func (config *Config) init() (*Config, error) {
 		config = DefaultConfig
 	}
 
-	if config.Database == "" {
-		config.Database = defaultDatabase
-	}
 	if config.Org == "" {
 		config.Org = defaultOrg
 	}
@@ -115,10 +106,6 @@ func RunCollector(ctx context.Context, config *Config) (*RunStats, error) {
 	// Ping InfluxDB to ensure there is a connection
 	if _, err := client.Ready(context.Background()); err != nil {
 		return nil, errors.Wrap(err, "influxdb no ready")
-	}
-
-	if _, err := client.QueryAPI(config.Org).QueryRaw(ctx, fmt.Sprintf("CREATE DATABASE \"%s\"", config.Database), nil); err != nil {
-		return nil, errors.Wrap(err, "influxdb initdb error")
 	}
 
 	_runStats := &RunStats{
