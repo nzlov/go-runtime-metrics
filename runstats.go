@@ -1,23 +1,25 @@
 package runstats
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"os"
 	"time"
 
-	"fmt"
-
-	"github.com/influxdata/influxdb/client/v2"
+	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
+	"github.com/influxdata/influxdb-client-go/v2/api"
+	"github.com/nzlov/go-runtime-metrics/collector"
 	"github.com/pkg/errors"
-	"github.com/tevjef/go-runtime-metrics/collector"
 )
 
 const (
 	defaultHost               = "localhost:8086"
 	defaultMeasurement        = "go.runtime"
 	defaultDatabase           = "stats"
+	defaultBucket             = "go"
+	defaultOrg                = "metrics"
 	defaultCollectionInterval = 10 * time.Second
-	defaultBatchInterval      = 60 * time.Second
 )
 
 // A configuration with default values.
@@ -26,49 +28,38 @@ var DefaultConfig = &Config{}
 type Config struct {
 	// InfluxDb host:port pair.
 	// Default is "localhost:8086".
-	Host string
+	Host string `json:"host" yaml:"host" mapstructure:"host"`
 
 	// Database to write points to.
 	// Default is "stats" and is auto created
-	Database string
+	Database string `json:"database" yaml:"database" mapstructure:"database"`
 
-	// Username with privileges on provided database.
-	Username string
+	// Token.
+	Token string `json:"token" yaml:"token" mapstructure:"token"`
 
-	// Password for provided user.
-	Password string
+	// Org.
+	Org string `json:"org" yaml:"org" mapstructure:"org"`
+
+	// Bucket.
+	Bucket string `json:"bucket" yaml:"bucket" mapstructure:"bucket"`
 
 	// Measurement to write points to.
 	// Default is "go.runtime.<hostname>".
-	Measurement string
-
-	// Measurement to write points to.
-	RetentionPolicy string
-
-	// Interval at which to write batched points to InfluxDB.
-	// Default is 60 seconds
-	BatchInterval time.Duration
-
-	// Precision in time to write your points in.
-	// Default is nanoseconds
-	Precision string
+	Measurement string `json:"measurement" yaml:"measurement" mapstructure:"measurement"`
 
 	// Interval at which to collect points.
 	// Default is 10 seconds
-	CollectionInterval time.Duration
+	CollectionInterval time.Duration `json:"collection_interval" yaml:"collection_interval" mapstructure:"collection_interval"`
 
 	// Disable collecting CPU Statistics. cpu.*
 	// Default is false
-	DisableCpu bool
+	DisableCpu bool `json:"disable_cpu" yaml:"disable_cpu" mapstructure:"disable_cpu"`
 
 	// Disable collecting Memory Statistics. mem.*
-	DisableMem bool
+	DisableMem bool `json:"disable_mem" yaml:"disable_mem" mapstructure:"disable_mem"`
 
 	// Disable collecting GC Statistics (requires Memory be not be disabled). mem.gc.*
-	DisableGc bool
-
-	// Default is DefaultLogger which exits when the library encounters a fatal error.
-	Logger Logger
+	DisableGc bool `json:"disable_gc" yaml:"disable_gc" mapstructure:"disable_gc"`
 }
 
 func (config *Config) init() (*Config, error) {
@@ -78,6 +69,12 @@ func (config *Config) init() (*Config, error) {
 
 	if config.Database == "" {
 		config.Database = defaultDatabase
+	}
+	if config.Org == "" {
+		config.Org = defaultOrg
+	}
+	if config.Bucket == "" {
+		config.Bucket = defaultBucket
 	}
 
 	if config.Host == "" {
@@ -98,61 +95,37 @@ func (config *Config) init() (*Config, error) {
 		config.CollectionInterval = defaultCollectionInterval
 	}
 
-	if config.BatchInterval == 0 {
-		config.BatchInterval = defaultBatchInterval
-	}
-
-	if config.Logger == nil {
-		config.Logger = &DefaultLogger{}
-	}
-
 	return config, nil
 }
 
-func RunCollector(config *Config) (err error) {
+func RunCollector(ctx context.Context, config *Config) (*RunStats, error) {
+	var err error
 	if config, err = config.init(); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Make client
-	clnt, err := client.NewHTTPClient(client.HTTPConfig{
-		Addr:     "http://" + config.Host,
-		Username: config.Username,
-		Password: config.Password,
-	})
+	client := influxdb2.NewClient(config.Host, config.Token)
+	// always close client at the end
 
 	if err != nil {
-		return errors.Wrap(err, "failed to create influxdb client")
+		return nil, errors.Wrap(err, "failed to create influxdb client")
 	}
 
 	// Ping InfluxDB to ensure there is a connection
-	if _, _, err := clnt.Ping(5 * time.Second); err != nil {
-		return errors.Wrap(err, "failed to ping influxdb client")
+	if _, err := client.Ready(context.Background()); err != nil {
+		return nil, errors.Wrap(err, "influxdb no ready")
 	}
 
-	// Auto create database
-	_, err = queryDB(clnt, fmt.Sprintf("CREATE DATABASE \"%s\"", config.Database))
-
-	if err != nil {
-		config.Logger.Fatalln(err)
+	if _, err := client.QueryAPI(config.Org).QueryRaw(ctx, fmt.Sprintf("CREATE DATABASE \"%s\"", config.Database), nil); err != nil {
+		return nil, errors.Wrap(err, "influxdb initdb error")
 	}
 
-	_runStats := &runStats{
-		logger: config.Logger,
-		client: clnt,
+	_runStats := &RunStats{
+		client: client,
 		config: config,
-		pc:     make(chan *client.Point),
+		write:  client.WriteAPI(config.Org, config.Bucket),
 	}
-
-	bp, err := _runStats.newBatch()
-
-	if err != nil {
-		return err
-	}
-
-	_runStats.points = bp
-
-	go _runStats.loop(config.BatchInterval)
 
 	_collector := collector.New(_runStats.onNewPoint)
 	_collector.PauseDur = config.CollectionInterval
@@ -162,76 +135,22 @@ func RunCollector(config *Config) (err error) {
 
 	go _collector.Run()
 
-	return nil
+	return _runStats, nil
 }
 
-type runStats struct {
+type RunStats struct {
 	logger Logger
-	client client.Client
-	points client.BatchPoints
+	client influxdb2.Client
 	config *Config
-	pc     chan *client.Point
+	write  api.WriteAPI
 }
 
-func (r *runStats) onNewPoint(fields collector.Fields) {
-	pt, err := client.NewPoint(r.config.Measurement, fields.Tags(), fields.Values(), time.Now())
-
-	if err != nil {
-		r.logger.Fatalln(errors.Wrap(err, "error while creating point"))
-	}
-
-	r.pc <- pt
+func (r *RunStats) Logger(log Logger) {
+	r.logger = log
 }
 
-func (r *runStats) newBatch() (bp client.BatchPoints, err error) {
-	bp, err = client.NewBatchPoints(client.BatchPointsConfig{
-		Database:        r.config.Database,
-		Precision:       r.config.Precision,
-		RetentionPolicy: r.config.RetentionPolicy,
-	})
-
-	if err != nil {
-		r.logger.Fatalln(errors.Wrap(err, "could not create BatchPoints"))
-	}
-
-	return
-}
-
-// Write collected points to influxdb periodically
-func (r *runStats) loop(interval time.Duration) {
-	ticks := time.Tick(interval)
-
-	for {
-		select {
-		case <-ticks:
-			if r.points == nil || len(r.points.Points()) <= 0 {
-				continue
-			}
-
-			if err := r.client.Write(r.points); err != nil {
-				r.logger.Fatalln(errors.Wrap(err, "could not write points to InfluxDB"))
-				continue
-			}
-
-			r.points = nil
-
-			bp, err := r.newBatch()
-
-			if err != nil {
-				r.logger.Fatalln(errors.Wrap(err, "could not create BatchPoints"))
-				continue
-			}
-
-			r.points = bp
-
-		case pt := <-r.pc:
-			if r.points != nil {
-				r.logger.Println(pt.String())
-
-				r.points.AddPoint(pt)
-			}
-		}
-	}
+func (r *RunStats) onNewPoint(fields collector.Fields) {
+	r.write.WritePoint(influxdb2.NewPoint(r.config.Measurement, fields.Tags(), fields.Values(), time.Now()))
 }
 
 type Logger interface {
@@ -242,19 +161,4 @@ type Logger interface {
 type DefaultLogger struct{}
 
 func (*DefaultLogger) Println(v ...interface{}) {}
-func (*DefaultLogger) Fatalln(v ...interface{}) { log.Fatalln(v) }
-
-func queryDB(clnt client.Client, cmd string) (res []client.Result, err error) {
-	q := client.Query{
-		Command: cmd,
-	}
-	if response, err := clnt.Query(q); err == nil {
-		if response.Error() != nil {
-			return res, response.Error()
-		}
-		res = response.Results
-	} else {
-		return res, err
-	}
-	return res, nil
-}
+func (*DefaultLogger) Fatalln(v ...interface{}) { log.Fatalln(v...) }

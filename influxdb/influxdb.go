@@ -2,7 +2,8 @@ package influxdb
 
 import (
 	"expvar"
-	"github.com/tevjef/go-runtime-metrics/collector"
+
+	"github.com/nzlov/go-runtime-metrics/collector"
 )
 
 // A structure compatible with Telegraf's InfluxDB input plugin format
